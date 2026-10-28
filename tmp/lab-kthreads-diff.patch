@@ -1,0 +1,840 @@
+diff --git a/Makefile b/Makefile
+index 629e7b6..20a4f05 100644
+--- a/Makefile
++++ b/Makefile
+@@ -144,7 +144,7 @@ $U/initcode: $U/initcode.S
+ tags: $(OBJS) _init
+ 	etags *.S *.c
+ 
+-ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
++ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o $U/uthread.o
+ 
+ ifeq ($(LAB),$(filter $(LAB), pgtbl lock))
+ ULIB += $U/statistics.o
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..45b8d4b 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -88,7 +88,7 @@ int             fork(void);
+ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+-void            proc_freepagetable(pagetable_t, uint64);
++void            proc_freepagetable(pagetable_t, uint64, int);
+ int             kill(int);
+ struct cpu*     mycpu(void);
+ struct cpu*     getmycpu(void);
+@@ -104,6 +104,9 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             clone(struct proc *, uint64, uint64, uint64, uint64);
++int             join(struct proc *, uint64, uint64);
++
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -170,6 +173,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             is_valid_va(pagetable_t, uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index d62d29d..43bfcc3 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -62,7 +62,7 @@ exec(char *path, char **argv)
+   ip = 0;
+ 
+   p = myproc();
+-  uint64 oldsz = p->sz;
++  uint64 oldsz = p->shared->sz;
+ 
+   // Allocate two pages at the next page boundary.
+   // Use the second as the user stack.
+@@ -109,18 +109,18 @@ exec(char *path, char **argv)
+   safestrcpy(p->name, last, sizeof(p->name));
+     
+   // Commit to the user image.
+-  oldpagetable = p->pagetable;
+-  p->pagetable = pagetable;
+-  p->sz = sz;
++  oldpagetable = p->shared->pagetable;
++  p->shared->pagetable = pagetable;
++  p->shared->sz = sz;
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
++  proc_freepagetable(oldpagetable, oldsz, p->threadID);
+ 
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+   if(pagetable)
+-    proc_freepagetable(pagetable, sz);
++    proc_freepagetable(pagetable, sz, p->threadID);
+   if(ip){
+     iunlockput(ip);
+     end_op();
+diff --git a/kernel/file.c b/kernel/file.c
+index 25fa226..d9171bb 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -94,7 +94,7 @@ filestat(struct file *f, uint64 addr)
+     ilock(f->ip);
+     stati(f->ip, &st);
+     iunlock(f->ip);
+-    if(copyout(p->pagetable, addr, (char *)&st, sizeof(st)) < 0)
++    if(copyout(p->shared->pagetable, addr, (char *)&st, sizeof(st)) < 0)
+       return -1;
+     return 0;
+   }
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 776f98c..75edef8 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -65,3 +65,5 @@
+ //   TRAPFRAME (p->trapframe, used by the trampoline)
+ //   TRAMPOLINE (the same page as in the kernel)
+ #define TRAPFRAME (TRAMPOLINE - PGSIZE)
++
++#define GET_TRAPFRAME(index) (TRAPFRAME - (index * PGSIZE))
+\ No newline at end of file
+diff --git a/kernel/pipe.c b/kernel/pipe.c
+index b6eefb9..dd4f3a3 100644
+--- a/kernel/pipe.c
++++ b/kernel/pipe.c
+@@ -90,7 +90,7 @@ pipewrite(struct pipe *pi, uint64 addr, int n)
+       sleep(&pi->nwrite, &pi->lock);
+     } else {
+       char ch;
+-      if(copyin(pr->pagetable, &ch, addr + i, 1) == -1)
++      if(copyin(pr->shared->pagetable, &ch, addr + i, 1) == -1)
+         break;
+       pi->data[pi->nwrite++ % PIPESIZE] = ch;
+       i++;
+@@ -121,7 +121,7 @@ piperead(struct pipe *pi, uint64 addr, int n)
+     if(pi->nread == pi->nwrite)
+       break;
+     ch = pi->data[pi->nread++ % PIPESIZE];
+-    if(copyout(pr->pagetable, addr + i, &ch, 1) == -1)
++    if(copyout(pr->shared->pagetable, addr + i, &ch, 1) == -1)
+       break;
+   }
+   wakeup(&pi->nwrite);  //DOC: piperead-wakeup
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..8c329d2 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -102,7 +102,7 @@ allocpid() {
+ // and return with p->lock held.
+ // If there are no free procs, or a memory allocation fails, return 0.
+ static struct proc*
+-allocproc(void)
++allocproc(const int should_allocate_shared)
+ {
+   struct proc *p;
+ 
+@@ -127,13 +127,34 @@ found:
+     return 0;
+   }
+ 
+-  // An empty user page table.
+-  p->pagetable = proc_pagetable(p);
+-  if(p->pagetable == 0){
+-    freeproc(p);
+-    release(&p->lock);
+-    return 0;
++  if (should_allocate_shared) {
++    if ((p->shared = (struct pshared *)kalloc()) == 0) {
++      freeproc(p);
++      release(&p->lock);
++      return 0;
++    }
++
++    p->shared->sz = 0;
++    p->shared->count = 1;
++    initlock(&p->shared->lock, "pshared_lock");
++    p->shared->pagetable = 0;
++
++    p->shared->ts[0] = UNAVAILABLE;
++    for (int i = 1; i < NPROC; i++) {
++      p->shared->ts[i] = AVAILABLE;
++    }
++
++    // An empty user page table.
++    p->shared->pagetable = proc_pagetable(p);
++    if(p->shared->pagetable == 0){
++      freeproc(p);
++      release(&p->lock);
++      return 0;
++    }
++  } else {
++    p->shared = 0;
+   }
++  p->threadID = 0;
+ 
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+@@ -153,10 +174,20 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
+-  p->pagetable = 0;
+-  p->sz = 0;
++  if(p->shared) {
++    if (p->shared->pagetable && p->shared->count == 1) {
++      proc_freepagetable(p->shared->pagetable, p->shared->sz, p->threadID);
++      kfree((void*)p->shared);
++    } else if (p->shared->pagetable && p->shared->count > 1) {
++      p->shared->count--;
++      uvmunmap(p->shared->pagetable, GET_TRAPFRAME(p->threadID), 1, 0);
++      p->shared->ts[p->threadID] = AVAILABLE;
++    } else if (p->shared->count < 1) {
++      printf("how\n");
++    }
++  }
++  p->threadID = 0;
++  p->shared = 0;
+   p->pid = 0;
+   p->parent = 0;
+   p->name[0] = 0;
+@@ -202,10 +233,10 @@ proc_pagetable(struct proc *p)
+ // Free a process's page table, and free the
+ // physical memory it refers to.
+ void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
++proc_freepagetable(pagetable_t pagetable, uint64 sz, int index)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, GET_TRAPFRAME(index), 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+@@ -227,13 +258,13 @@ userinit(void)
+ {
+   struct proc *p;
+ 
+-  p = allocproc();
++  p = allocproc(1);
+   initproc = p;
+   
+   // allocate one user page and copy init's instructions
+   // and data into it.
+-  uvminit(p->pagetable, initcode, sizeof(initcode));
+-  p->sz = PGSIZE;
++  uvminit(p->shared->pagetable, initcode, sizeof(initcode));
++  p->shared->sz = PGSIZE;
+ 
+   // prepare for the very first "return" from kernel to user.
+   p->trapframe->epc = 0;      // user program counter
+@@ -255,15 +286,18 @@ growproc(int n)
+   uint sz;
+   struct proc *p = myproc();
+ 
+-  sz = p->sz;
++  acquire(&p->shared->lock);
++  sz = p->shared->sz;
+   if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
++    if((sz = uvmalloc(p->shared->pagetable, sz, sz + n)) == 0) {
++      release(&p->shared->lock);
+       return -1;
+     }
+   } else if(n < 0){
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
++    sz = uvmdealloc(p->shared->pagetable, sz, sz + n);
+   }
+-  p->sz = sz;
++  p->shared->sz = sz;
++  release(&p->shared->lock);
+   return 0;
+ }
+ 
+@@ -277,17 +311,20 @@ fork(void)
+   struct proc *p = myproc();
+ 
+   // Allocate process.
+-  if((np = allocproc()) == 0){
++  if((np = allocproc(1)) == 0){
+     return -1;
+   }
+ 
++  acquire(&p->shared->lock);
+   // Copy user memory from parent to child.
+-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++  if(uvmcopy(p->shared->pagetable, np->shared->pagetable, p->shared->sz) < 0){
++    release(&p->shared->lock);
+     freeproc(np);
+     release(&np->lock);
+     return -1;
+   }
+-  np->sz = p->sz;
++  np->shared->sz = p->shared->sz;
++  release(&p->shared->lock);
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -393,7 +430,7 @@ wait(uint64 addr)
+     // Scan through table looking for exited children.
+     havekids = 0;
+     for(np = proc; np < &proc[NPROC]; np++){
+-      if(np->parent == p){
++      if(np->parent == p && np->threadID == 0){
+         // make sure the child isn't still in exit() or swtch().
+         acquire(&np->lock);
+ 
+@@ -401,7 +438,7 @@ wait(uint64 addr)
+         if(np->state == ZOMBIE){
+           // Found one.
+           pid = np->pid;
+-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
++          if(addr != 0 && copyout(p->shared->pagetable, addr, (char *)&np->xstate,
+                                   sizeof(np->xstate)) < 0) {
+             release(&np->lock);
+             release(&wait_lock);
+@@ -603,12 +640,16 @@ int
+ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
+ {
+   struct proc *p = myproc();
++  int retval = 0;
+   if(user_dst){
+-    return copyout(p->pagetable, dst, src, len);
++    acquire(&p->shared->lock);
++    retval = copyout(p->shared->pagetable, dst, src, len);
++    release(&p->shared->lock);
+   } else {
+     memmove((char *)dst, src, len);
+-    return 0;
++    retval = 0;
+   }
++  return retval;
+ }
+ 
+ // Copy from either a user address, or kernel address,
+@@ -618,12 +659,16 @@ int
+ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+ {
+   struct proc *p = myproc();
++  int retval = 0;
+   if(user_src){
+-    return copyin(p->pagetable, dst, src, len);
++    acquire(&p->shared->lock);
++    retval = copyin(p->shared->pagetable, dst, src, len);
++    release(&p->shared->lock);
+   } else {
+     memmove(dst, (char*)src, len);
+-    return 0;
++    retval = 0;
+   }
++  return retval;
+ }
+ 
+ // Print a process listing to console.  For debugging.
+@@ -654,3 +699,139 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++clone(struct proc * p, uint64 fn, uint64 arg1, uint64 arg2, uint64 stack)
++{
++  int i, pid;
++  struct proc *np;
++
++  // Allocate process.
++  if((np = allocproc(0)) == 0){
++    return -1;
++  }
++
++  np->shared = p->shared;
++  p->shared->count++;
++  // copy saved user registers.
++  *(np->trapframe) = *(p->trapframe);
++
++  // Cause fork to return 0 in the child.f
++  np->trapframe->a0 = arg1;
++  np->trapframe->a1 = arg2;
++  np->trapframe->epc = fn;
++  np->trapframe->sp = stack + PGSIZE;
++
++  for (int i = 1; i < NPROC; i++) {
++    if (np->shared->ts[i] == AVAILABLE) {
++      np->shared->ts[i] = UNAVAILABLE;
++      np->threadID = i;
++      break;
++    }
++  }
++
++  // acquire(&p->shared->lock);
++  uint64 trapframeAddress = (uint64) GET_TRAPFRAME(np->threadID);
++  if (is_valid_va(p->shared->pagetable, trapframeAddress)) {
++    uvmunmap(p->shared->pagetable, trapframeAddress, 1, 0);
++  }
++
++  if (mappages(p->shared->pagetable, trapframeAddress, PGSIZE, (uint64)(np->trapframe), PTE_R | PTE_W) < 0) {
++    freeproc(np);
++    release(&np->lock);
++    // release(&p->shared->lock);
++    return -1;
++  }
++  // release(&p->shared->lock);
++
++  // increment reference counts on open file descriptors.
++  for(i = 0; i < NOFILE; i++)
++    if(p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  pid = np->pid;
++
++  release(&np->lock);
++
++  acquire(&wait_lock);
++  np->parent = p;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return pid;
++}
++
++int
++join(struct proc * p, uint64 userStack, uint64 userRetVal)
++{
++  struct proc *np;
++  int havekids;
++
++  acquire(&wait_lock);
++
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(np = proc; np < &proc[NPROC]; np++){
++      if(np->parent == p && np->threadID > 0){
++        // make sure the child isn't still in exit() or swtch().
++        acquire(&np->lock);
++
++        havekids = 1;
++        if(np->state == ZOMBIE){
++          acquire(&np->shared->lock);
++          // found a valid thread
++
++          uint64 retval = np->xstate;
++          uint64 stack = PGROUNDDOWN(np->trapframe->sp);
++
++          if (userStack > stack && userStack < PGROUNDUP(stack)) {
++            release(&wait_lock);
++            release(&np->lock);
++            release(&np->shared->lock);
++            return -1;
++          }
++
++          if (copyout(p->shared->pagetable, userStack, (char *) &stack, sizeof(uint64)) < 0) {
++            release(&wait_lock);
++            release(&np->lock);
++            release(&np->shared->lock);
++            return -1;
++          }
++
++          if (userRetVal && copyout(p->shared->pagetable, userRetVal, (char *) &retval, sizeof(uint32)) < 0) {
++            release(&wait_lock);
++            release(&np->lock);
++            release(&np->shared->lock);
++            return -1;
++          }
++
++          int pid = np->pid;
++          release(&np->shared->lock);
++          freeproc(np);
++          release(&wait_lock);
++          release(&np->lock);
++          return pid;
++        }
++        release(&np->lock);
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || p->killed){
++      release(&wait_lock);
++      return -1;
++    }
++    
++    // Wait for a child to exit.
++    sleep(p, &wait_lock);  //DOC: wait-sleep
++  }
++
++  return -1;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..4e1992d 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -82,6 +82,16 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++enum trapstate { AVAILABLE, UNAVAILABLE };
++
++struct pshared {              // keeps track of shared memory, indicating how many processes/clones are sharing the memory, and holding a reference to the page table
++  struct spinlock lock;
++  pagetable_t pagetable;
++  uint64 sz;
++  int count;
++  enum trapstate ts[NPROC];
++};
++
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -93,13 +103,14 @@ struct proc {
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+ 
++  int threadID;
++  struct pshared * shared;
++    
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+ 
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+-  uint64 sz;                   // Size of process memory (bytes)
+-  pagetable_t pagetable;       // User page table
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..6d2dc55 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -12,9 +12,9 @@ int
+ fetchaddr(uint64 addr, uint64 *ip)
+ {
+   struct proc *p = myproc();
+-  if(addr >= p->sz || addr+sizeof(uint64) > p->sz)
++  if(addr >= p->shared->sz || addr+sizeof(uint64) > p->shared->sz)
+     return -1;
+-  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
++  if(copyin(p->shared->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
+     return -1;
+   return 0;
+ }
+@@ -25,7 +25,7 @@ int
+ fetchstr(uint64 addr, char *buf, int max)
+ {
+   struct proc *p = myproc();
+-  int err = copyinstr(p->pagetable, buf, addr, max);
++  int err = copyinstr(p->shared->pagetable, buf, addr, max);
+   if(err < 0)
+     return err;
+   return strlen(buf);
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_clone(void);
++extern uint64 sys_join(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,8 +129,11 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_clone]   sys_clone,
++[SYS_join]    sys_join,
+ };
+ 
++
+ void
+ syscall(void)
+ {
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..9475e62 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_clone  22
++#define SYS_join   23
+\ No newline at end of file
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..0ec4d67 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -474,8 +474,8 @@ sys_pipe(void)
+     fileclose(wf);
+     return -1;
+   }
+-  if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+-     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
++  if(copyout(p->shared->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
++     copyout(p->shared->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+     p->ofile[fd0] = 0;
+     p->ofile[fd1] = 0;
+     fileclose(rf);
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..e919896 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -29,6 +29,57 @@ sys_fork(void)
+   return fork();
+ }
+ 
++
++
++uint64
++sys_clone(void)
++{
++  uint64 fn_ptr;
++  uint64 arg1;
++  uint64 arg2;
++  uint64 stack_ptr;
++
++  if (argaddr(0, &fn_ptr) < 0)
++    return -1;
++  if (argaddr(1, &arg1) < 0)
++    return -1;
++  if (argaddr(2, &arg2) < 0)
++    return -1;
++  if (argaddr(3, &stack_ptr) < 0)
++    return -1;
++
++  struct proc * p = myproc();
++  acquire(&p->shared->lock);
++  if (stack_ptr % PGSIZE != 0 || !is_valid_va(p->shared->pagetable, stack_ptr) || stack_ptr == 0 || !is_valid_va(p->shared->pagetable, fn_ptr)) {
++    release(&p->shared->lock);
++    return -1;
++  }
++  release(&p->shared->lock);
++
++  return clone(p, fn_ptr, arg1, arg2, stack_ptr);
++}
++
++uint64
++sys_join(void)
++{
++  uint64 stack;
++  uint64 retval;
++
++  struct proc * p = myproc();
++
++  acquire(&p->shared->lock);
++  if (argaddr(0, &stack) < 0 || !is_valid_va(p->shared->pagetable, stack)) {
++    release(&p->shared->lock);
++    return -1;
++  }
++  release(&p->shared->lock);
++
++  if (argaddr(1, &retval) < 0)
++    return -1;
++
++  return join(p, stack, retval);
++}
++
+ uint64
+ sys_wait(void)
+ {
+@@ -46,7 +97,7 @@ sys_sbrk(void)
+ 
+   if(argint(0, &n) < 0)
+     return -1;
+-  addr = myproc()->sz;
++  addr = myproc()->shared->sz;
+   if(growproc(n) < 0)
+     return -1;
+   return addr;
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..020cfca 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -119,13 +119,13 @@ usertrapret(void)
+   w_sepc(p->trapframe->epc);
+ 
+   // tell trampoline.S the user page table to switch to.
+-  uint64 satp = MAKE_SATP(p->pagetable);
++  uint64 satp = MAKE_SATP(p->shared->pagetable);
+ 
+   // jump to trampoline.S at the top of memory, which 
+   // switches to the user page table, restores user registers,
+   // and switches to user mode with sret.
+   uint64 fn = TRAMPOLINE + (userret - trampoline);
+-  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
++  ((void (*)(uint64,uint64))fn)(GET_TRAPFRAME(p->threadID), satp);
+ }
+ 
+ // interrupts and exceptions from kernel code go here via kernelvec,
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..85811ce 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -432,3 +432,18 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++
++// Helper to check if a user virtual address is mapped
++int is_valid_va(pagetable_t pagetable, uint64 va) {
++  pte_t * pte = 0;
++  if (va >= MAXVA) {
++    return 0;
++  }
++
++  if ((pte = walk(pagetable, va, 0)) == 0) {
++    return 0;
++  }
++
++  return (*pte & PTE_V);
++}
+\ No newline at end of file
+diff --git a/user/sh.c b/user/sh.c
+index 83dd513..c96dab0 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -54,6 +54,7 @@ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
+ // Execute cmd.  Never returns.
++__attribute__((noreturn))
+ void
+ runcmd(struct cmd *cmd)
+ {
+diff --git a/user/user.h b/user/user.h
+index b71ecda..0c74722 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,12 @@
+ struct stat;
+ struct rtcdate;
+ 
++struct __lock {
++    int lastTicket;
++    int currentTicket;
++};
++typedef struct __lock lock_t;
++
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
+@@ -23,6 +29,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int clone(void(*)(uint64, uint64), uint64, uint64, void*);
++int join(void **, int *);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+@@ -40,3 +48,8 @@ void free(void*);
+ int atoi(const char*);
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
++int thread_create(void (*fn)(uint64, uint64), uint64 arg1, uint64 arg2);
++int thread_join(int *retval);
++void lock_init(lock_t *);
++void lock_acquire(lock_t *);
++void lock_release(lock_t *);
+\ No newline at end of file
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..a19b83e 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("clone");
++entry("join");
+diff --git a/user/uthread.c b/user/uthread.c
+new file mode 100644
+index 0000000..f73ffbf
+--- /dev/null
++++ b/user/uthread.c
+@@ -0,0 +1,70 @@
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/clone_common.h" // for PGSIZE
++#include <stdint.h>
++
++#define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
++#define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
++
++// typedef struct thread {
++//     void *stack;
++// } thread_t;
++
++// #define MAX_THREADS 64
++// static void *thread_stacks[MAX_THREADS] = {0};
++
++int thread_create(void (*fn)(uint64, uint64), uint64 arg1, uint64 arg2) {
++    char * stack = (char *) malloc(PGSIZE * 3);
++    char * stack_clone = 0;
++
++    uint64 stack_address = (uintptr_t)&(*stack);
++
++    uint64 stack_clone_address = PGROUNDUP(PGROUNDUP(stack_address)+1);
++
++    stack_clone = &stack[stack_clone_address - stack_address];
++
++    *((char **) (stack_clone - 8)) = stack;
++
++    int pid = -1;
++    if ((pid = clone(fn, arg1, arg2, stack_clone)) == -1) {
++        free(stack);
++        return -1;
++    }
++    return pid;
++}
++
++int thread_join(int *retval) {
++    char * stack_clone;
++    int pid = -1;
++
++    if (retval) {
++        pid = join((void **) &stack_clone, retval);
++    } else {
++        pid = join((void **) &stack_clone, 0);
++    }
++
++    if (pid != -1) {
++        char * pointer_to_stack = (char *) (stack_clone - 8);
++        char * stack = *((char **) pointer_to_stack);
++        free(stack);
++    }
++
++
++    return pid;
++}
++
++void lock_init(lock_t * lock) {
++    lock->lastTicket = 0;
++    lock->currentTicket = 0;
++}
++
++void lock_acquire(lock_t * lock) {
++    int myTicket = __sync_fetch_and_add(&lock->lastTicket, 1);
++    while (lock->currentTicket != myTicket) {
++        continue;
++    }
++}
++
++void lock_release(lock_t * lock) {
++    __sync_fetch_and_add(&lock->currentTicket, 1);
++}
+\ No newline at end of file
